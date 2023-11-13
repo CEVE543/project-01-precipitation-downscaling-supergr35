@@ -301,4 +301,14 @@ function run_demo()
     return nothing
 end
 
-run_demo()
+# run_demo()
+
+function download_data()
+    data_dir = joinpath(HOMEDIR, "data", "raw") 
+    years = 1979:2022 # example time range
+        for year in years
+            # Download 2m air temperature for the years
+            download_single_level_data.(
+                year, joinpath(data_dir, "2m_temperature_$year.nc"), "2m_temperature"
+            )
+end
