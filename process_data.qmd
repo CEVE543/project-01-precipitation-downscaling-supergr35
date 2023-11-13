@@ -1,0 +1,344 @@
+---
+title: "Process Data"
+jupyter: julia-1.9
+---
+
+```{julia}
+#| output: false
+using NCDatasets
+using DataStructures
+using Dates
+using GLM
+using Turing
+using Optim
+using DynamicHMC
+```
+
+Need to combine data from 1979-2022, ideally into one file
+```{julia}
+# dummy case: read in 1 data file
+temp_1979_ds = NCDataset("data/raw/2m_temperature_1979.nc")
+temp_1980_ds = NCDataset("data/raw/2m_temperature_1980.nc")
+
+# gridcells are 66x27. we need to pick the ones that constitute the texas area
+# found these indices by inspecting data
+lat_lower = 27
+lat_upper = 14
+lon_left = 24
+lon_right = 38
+
+# select only texas gridcells
+temp_1979 = temp_1979_ds["t2m"][lon_left:lon_right,lat_upper:lat_lower,:]
+time_1979 = temp_1979_ds["time"][:]
+temp_1980 = temp_1980_ds["t2m"][lon_left:lon_right,lat_upper:lat_lower,:]
+time_1980 = temp_1980_ds["time"][:]
+
+# join matrices
+temp_joined = cat(temp_1979, temp_1980, dims=3)
+time_joined = cat(time_1979, time_1980, dims=1)
+```
+
+```{julia}
+# now, we'll do this iteratively for all years
+datasets = OrderedDict()
+
+for year in 1979:2022
+    datasets["temp_$(year)_ds"] = NCDataset("data/raw/2m_temperature_$(year).nc")
+end
+
+temp_joined = datasets["temp_1979_ds"]["t2m"][lon_left:lon_right,lat_upper:lat_lower,:]
+time_joined = datasets["temp_1979_ds"]["time"][:] 
+
+for (key, dataset) in datasets
+    # skip the first dataset since it's already in the joined variable
+    if key == "temp_1979_ds"
+        continue
+    end
+    # pick Texas out of the current dataset and add it to the joined dataset, also join time
+    temp_current = dataset["t2m"][lon_left:lon_right,lat_upper:lat_lower,:]
+    time_current = dataset["time"][:]
+    temp_joined = cat(temp_joined, temp_current, dims=3)
+    time_joined = cat(time_joined, time_current, dims=1)
+end
+
+# reshape temp_joined to have 24 time steps per column
+temp_reshaped = reshape(temp_joined, size(temp_joined, 1), size(temp_joined, 2), 24, :)
+# take the mean of each 24-step block along the 3rd dimension
+temp_averaged = mean(temp_reshaped, dims=3)
+# reshape back to original shape
+temp_joined_averaged = reshape(temp_averaged, size(temp_joined, 1), size(temp_joined, 2), :)
+
+time_joined_dates = unique([Dates.Date(x) for x in time_joined])
+time_len = length(time_joined_dates)
+
+temp_joined_averaged = reverse(temp_joined_averaged; dims=2)
+
+```
+
+```{julia}
+# Subset the precip_tx data to be the same timescale (1979-2022)
+precip_tx = NCDataset("data/raw/precip_tx.nc")
+precip_tx_joined = precip_tx["precip"][:,:,1:time_len]
+precip_lon = precip_tx["lon"][:]
+precip_lat = precip_tx["lat"][:]
+precip_lat = reverse(precip_lat)
+precip_tx_joined = reverse(precip_tx_joined; dims=2)
+```
+
+Now, I'll do a PCA-KNN analysis like we did in Lab 6.
+
+Define the functions we'll use:
+```{julia}
+
+# preprocess functions by getting climatology--same as lab 6
+function preprocess(temp::Array{T,3}, temp_ref::Array{T,3})::AbstractMatrix where {T}
+    n_lon, n_lat, n_t = size(temp)
+    climatology = mean(temp_ref; dims=3)
+    temp_anom = temp .- climatology
+
+    # reshape to 2D
+    temp_anom = reshape(temp_anom, n_lon * n_lat, n_t)
+
+    # strip the units
+    return temp_anom
+end
+
+
+# helper functions for knn
+function euclidean_distance(x::AbstractVector, y::AbstractVector)::AbstractFloat
+    return sqrt(sum((x .- y) .^ 2))
+end
+
+function nsmallest(x::AbstractVector, n::Int)::Vector{Int}
+    idx = sortperm(x)
+    return idx[1:n]
+end
+
+# calculate knn for a feature matrix with X_i input. From lab 6
+function knn(X::AbstractMatrix, X_i::AbstractVector, K::Int)::Tuple{Int,AbstractVector}
+    # calculate the distances between X_i and each row of X
+    dist = [euclidean_distance(X_i, X[j, :]) for j in 1:size(X, 1)]
+    idx = nsmallest(dist, K)
+    w = 1 ./ dist[idx]
+    w ./= sum(w)
+    idx_sample = sample(idx, Weights(w))
+    return (idx_sample, vec(X[idx_sample, :]))
+end
+
+# do the whole knn analysis with our data. From lab 6
+function predict_knn(temp_train, temp_test, precip_train; n_pca::Int)
+    X_train = preprocess(temp_train, temp_train)
+    X_test = preprocess(temp_test, temp_train)
+
+    # fit the PCA model to the training data
+    pca_model = fit(PCA, X_train; maxoutdim=n_pca)
+
+    # project the test data onto the PCA basis
+    train_embedded = predict(pca_model, X_train)
+    test_embedded = predict(pca_model, X_test)
+
+    # use the `knn` function for each point in the test data
+    precip_pred = map(1:size(X_test, 2)) do i
+        idx, _ = knn(train_embedded', test_embedded[:, i], 3)
+        precip_train[:, :, idx]
+    end
+
+    # return a matrix of predictions
+    return precip_pred
+end
+
+# This was part of my attempt at a linear regression like we learned in class, but unfortunately a statistical approach caused too many errors that I couldn't figure out.
+# @model function poisson_regression(y::AbstractVector, x::AbstractVector)
+#     # priors
+#     α ~ Normal(0, 5)
+#     β ~ Normal(0, 5)
+
+#     # likelihood
+#     λ = @. exp(α + β * x)
+#     return y .~ Poisson.(λ)
+# end
+
+# Linear regression function. Similar to predict_knn, but do a linear regression instead of knn
+function predict_lm(temp_train, precip_train;)
+    X_train = preprocess(temp_train, temp_train)
+
+    # fit the PCA model to the training data
+    # I'm only using 1 PC since it explains the most variance and can be used as regression for all the timesteps for each gridcell.
+    # The scree plot elbow was roughly after the 1st or 2nd PC, so this should account for a lot of the variance.
+    pca_model = fit(PCA, X_train; maxoutdim=1)
+
+    # project the test data onto the PCA basis
+    train_embedded = predict(pca_model, X_train)
+
+    # now we have PC vlues for training/testing data. For the gridcell in precip, let's do a linear model using our PCA as a predictor.
+
+    # need to make a dataframe for lm syntax
+    df = DataFrame(x=vec(train_embedded'), y=Float64.(precip_train))
+    reg_model = lm(@formula(y ~ x), df)
+end
+```
+
+
+Now, I'll make an attempt to run PCA/KNN on the temperature data and the precip_tx data
+```{julia}
+# Split the data into training/testing
+idx_partition = findfirst(time_joined_dates .== time_joined_dates[end] - Dates.Year(10))
+train_idx = 1:idx_partition
+test_idx = (idx_partition+1):time_len
+
+precip_train = precip_tx_joined[:, :, train_idx]
+precip_test = precip_tx_joined[:, :, test_idx]
+temp_train = temp_joined_averaged[:, :, train_idx]
+temp_test = temp_joined_averaged[:, :, test_idx]
+time_train = time_joined_dates[train_idx]
+time_test = time_joined_dates[test_idx]
+
+# preprocess the data for climatology
+n_lon, n_lat, n_t = size(temp_joined_averaged)
+
+# predict KNN for 3 random days from the testing data
+t_sample = rand(1:size(temp_test, 3), 3)
+precip_pred = predict_knn(temp_train, temp_test[:, :, t_sample], precip_train; n_pca=3)
+
+mse_pcaknn = [0.0,0.0,0.0]
+# plot the difference between predicted precipitation and actual precipitation in the test set
+p = map(eachindex(t_sample)) do ti
+    t = t_sample[ti]
+    y_pred = precip_pred[ti]'
+    y_actual = precip_test[:, :, t]'
+    mse_pcaknn[ti] = (mean(skipmissing((y_actual .- y_pred).^2)))
+    cmax = max(maximum(skipmissing(y_pred)), maximum(skipmissing(y_actual)))
+
+    p1 = heatmap(
+        precip_lon,
+        precip_lat,
+        y_pred;
+        xlabel="Longitude",
+        ylabel="Latitude",
+        title="Predicted",
+        aspect_ratio=:equal,
+        clims=(0, cmax)
+    )
+    p2 = heatmap(
+        precip_lon,
+        precip_lat,
+        y_actual;
+        xlabel="Longitude",
+        ylabel="Latitude",
+        title="Actual",
+        aspect_ratio=:equal,
+        clims=(0, cmax)
+    )
+    plot(p1, p2; layout=(2, 1), size=(1000, 400))
+end
+plot(p...; layout=(2, 3), size=(1500, 1200))
+```
+
+Here is my code block for linear regression. I was able to implement an approach that did linear regression on the principal components to a gridcell in the precipitation data.
+
+```{julia}
+
+# x1, x2 are the coordinates for the precip gridcell of choice, I'll just do 5,5 as an example
+x1 = rand(1:24)
+x2 = rand(1:24)
+precip_gridcell = precip_train[x1, x2, :]
+# need to get rid of missing values in precip, so I'll replace them with 0 here. This probably negatively affects my fit by quite a bit, but this is the problem with linear regresion.
+precip_gridcell = replace(precip_gridcell, missing => 0)
+
+reg_model = predict_lm(temp_train, precip_gridcell)
+
+precip_pred = predict(reg_model, DataFrame(x=temp_test[x1, x2, :]))
+plot(time_test, precip_pred)
+plot!(time_test, precip_test[x1, x2, :])
+```
+
+Here are some metrics that see how good my fit was, and also justify the number of PCA components.
+```{julia}
+# create a scree plot to justify the number of PC's used
+pca_model = fit(PCA, preprocess(temp_train, temp_train); maxoutdim=25, pratio=0.999);
+plot(
+    principalvars(pca_model) / var(pca_model);
+    xlabel="# of PCs",
+    ylabel="Fraction of Variance Explained",
+    label=false,
+    title="Variance Explained"
+)
+```
+Notice the elbow of the scree plot is pretty much at PC=2. The first principle component explains over 90% of the variance of the data, so using only 2 PCs for KNN is a pretty valid choice as is using only 1 PC for the regression for ease of coding.
+
+```{julia}
+# calculate MSE for PCA by taking the mean of the 3 timesteps
+mse_avg_knn = mean(mse_pcaknn)
+
+# calculate MSE for linear model
+mse_lm = mean((precip_test[x1, x2, :] .- precip_pred).^2)
+```
+
+
+Below was my best attempt at doing a quantile-quantile model for downscaling. I didn't include it as I couldn't get it to work with downscaling, but I include it here to show some of the work I put into this project.
+
+```julia
+# define a function to flatten 3-D data
+# as a note: this was annoying to figure out in the last lab, and I think it'd be a good candidate for code to just give us in the lab
+function flatten_3d(data3d)
+    n_lon, n_lat, n_t = size(data3d)
+    reshaped = reshape(data3d, n_lon * n_lat, n_t) 
+    return reshaped
+end
+
+# helper function to find the index of the precipitation value mapped to an input temperature value
+function get_quantile_index(temp_val, temp_q)
+    # Find the index of the temperature quantile
+    idx = findfirst(x -> x >= temp_val, temp_q)
+    return idx
+end
+
+# get gridcells on an axis
+temp_train_rs = flatten_3d(temp_train)
+precip_train_rs = flatten_3d(precip_train)
+# precip_train_rs = replace(precip_train_rs, missing => 0)
+
+# for now, dummy case at first timestep
+temp_quantiles = quantile(temp_train_rs[:,1], 0:0.01:1)
+precip_quantiles = quantile(skipmissing(precip_train_rs[:,1]), 0:0.01:1)
+
+precip_mapped = similar(precip_train_rs[:,1])
+
+for (idx, t) in enumerate(temp_train_rs[:,1], precip_train)
+    q_idx = get_quantile_index(t,temp_quantiles)
+    # select the mapped quantile given its index
+    val = precip_quantiles[q_idx]
+    # case to deal with the missing coastline data
+    if precip_train[idx] == missing:
+        continue
+    precip_mapped[idx] = val
+end
+
+# # unflatten the precip_mapped data
+precip_mapped_regridded = reshape(precip_mapped, (24, 24))
+precip_mapped_regridded = replace(precip_mapped_regridded, NaN => missing)
+cmax = max(maximum(skipmissing(precip_mapped_regridded)), maximum(skipmissing(precip_train[:,:,1])))
+
+# p1 = heatmap(
+#     precip_lon,
+#     precip_lat,
+#     precip_mapped_regridded';
+#     xlabel="Longitude",
+#     ylabel="Latitude",
+#     title="Predicted",
+#     aspect_ratio=:equal,
+#     clims=(0, cmax)
+# )
+
+# p2 = heatmap(
+#     precip_lon,
+#     precip_lat,
+#     precip_train[:,:,1]';
+#     xlabel="Longitude",
+#     ylabel="Latitude",
+#     title="Actual",
+#     aspect_ratio=:equal,
+#     clims=(0, cmax)
+# ) 
+# plot(p1, p2; layout=(2, 1), size=(1000, 400))
+```
