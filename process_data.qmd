@@ -1,6 +1,8 @@
 ---
 title: "Process Data"
 jupyter: julia-1.9
+execute:
+    echo: false
 ---
 
 ```{julia}
@@ -12,13 +14,18 @@ using GLM
 using Turing
 using Optim
 using DynamicHMC
+using MultivariateStats
+using StatsBase
+using Plots
+using DataFrames
 ```
 
-Need to combine data from 1979-2022, ideally into one file
 ```{julia}
+# This code block was just to figure out what I was doing mostly, the next is for the general case
+# Please ignore random semicolons. I kept getting weird outputs in my quarto so I had to deal with this.
 # dummy case: read in 1 data file
-temp_1979_ds = NCDataset("data/raw/2m_temperature_1979.nc")
-temp_1980_ds = NCDataset("data/raw/2m_temperature_1980.nc")
+temp_1979_ds = NCDataset("data/raw/2m_temperature_1979.nc");
+temp_1980_ds = NCDataset("data/raw/2m_temperature_1980.nc");
 
 # gridcells are 66x27. we need to pick the ones that constitute the texas area
 # found these indices by inspecting data
@@ -34,8 +41,8 @@ temp_1980 = temp_1980_ds["t2m"][lon_left:lon_right,lat_upper:lat_lower,:]
 time_1980 = temp_1980_ds["time"][:]
 
 # join matrices
-temp_joined = cat(temp_1979, temp_1980, dims=3)
-time_joined = cat(time_1979, time_1980, dims=1)
+temp_joined = cat(temp_1979, temp_1980, dims=3);
+time_joined = cat(time_1979, time_1980, dims=1);
 ```
 
 ```{julia}
@@ -43,11 +50,11 @@ time_joined = cat(time_1979, time_1980, dims=1)
 datasets = OrderedDict()
 
 for year in 1979:2022
-    datasets["temp_$(year)_ds"] = NCDataset("data/raw/2m_temperature_$(year).nc")
+    datasets["temp_$(year)_ds"] = NCDataset("data/raw/2m_temperature_$(year).nc");
 end
 
-temp_joined = datasets["temp_1979_ds"]["t2m"][lon_left:lon_right,lat_upper:lat_lower,:]
-time_joined = datasets["temp_1979_ds"]["time"][:] 
+temp_joined = datasets["temp_1979_ds"]["t2m"][lon_left:lon_right,lat_upper:lat_lower,:];
+time_joined = datasets["temp_1979_ds"]["time"][:];
 
 for (key, dataset) in datasets
     # skip the first dataset since it's already in the joined variable
@@ -66,26 +73,23 @@ temp_reshaped = reshape(temp_joined, size(temp_joined, 1), size(temp_joined, 2),
 # take the mean of each 24-step block along the 3rd dimension
 temp_averaged = mean(temp_reshaped, dims=3)
 # reshape back to original shape
-temp_joined_averaged = reshape(temp_averaged, size(temp_joined, 1), size(temp_joined, 2), :)
+temp_joined_averaged = reshape(temp_averaged, size(temp_joined, 1), size(temp_joined, 2), :);
 
 time_joined_dates = unique([Dates.Date(x) for x in time_joined])
 time_len = length(time_joined_dates)
 
-temp_joined_averaged = reverse(temp_joined_averaged; dims=2)
-
+temp_joined_averaged = reverse(temp_joined_averaged; dims=2);
 ```
 
 ```{julia}
 # Subset the precip_tx data to be the same timescale (1979-2022)
-precip_tx = NCDataset("data/raw/precip_tx.nc")
+precip_tx = NCDataset("data/raw/precip_tx.nc");
 precip_tx_joined = precip_tx["precip"][:,:,1:time_len]
 precip_lon = precip_tx["lon"][:]
 precip_lat = precip_tx["lat"][:]
 precip_lat = reverse(precip_lat)
-precip_tx_joined = reverse(precip_tx_joined; dims=2)
+precip_tx_joined = reverse(precip_tx_joined; dims=2);
 ```
-
-Now, I'll do a PCA-KNN analysis like we did in Lab 6.
 
 Define the functions we'll use:
 ```{julia}
@@ -113,6 +117,8 @@ function nsmallest(x::AbstractVector, n::Int)::Vector{Int}
     idx = sortperm(x)
     return idx[1:n]
 end
+
+
 
 # calculate knn for a feature matrix with X_i input. From lab 6
 function knn(X::AbstractMatrix, X_i::AbstractVector, K::Int)::Tuple{Int,AbstractVector}
@@ -178,8 +184,10 @@ function predict_lm(temp_train, precip_train;)
 end
 ```
 
+# Exploratory Data Analysis
 
-Now, I'll make an attempt to run PCA/KNN on the temperature data and the precip_tx data
+Now, I'll do a PCA-KNN analysis like we did in Lab 6. I'll detail the methods more in the relevant section. Below is the results from 3 randomly selected days of this PCA-KNN analysis.
+
 ```{julia}
 # Split the data into training/testing
 idx_partition = findfirst(time_joined_dates .== time_joined_dates[end] - Dates.Year(10))
@@ -234,7 +242,7 @@ end
 plot(p...; layout=(2, 3), size=(1500, 1200))
 ```
 
-Here is my code block for linear regression. I was able to implement an approach that did linear regression on the principal components to a gridcell in the precipitation data.
+Here is a plot for linear regression. I was able to implement an approach that did linear regression on the principal components to a randomly selected gridcell in the precipitation data.
 
 ```{julia}
 
@@ -245,14 +253,31 @@ precip_gridcell = precip_train[x1, x2, :]
 # need to get rid of missing values in precip, so I'll replace them with 0 here. This probably negatively affects my fit by quite a bit, but this is the problem with linear regresion.
 precip_gridcell = replace(precip_gridcell, missing => 0)
 
-reg_model = predict_lm(temp_train, precip_gridcell)
+#reg_model = predict_lm(temp_train, precip_gridcell)
 
-precip_pred = predict(reg_model, DataFrame(x=temp_test[x1, x2, :]))
-plot(time_test, precip_pred)
-plot!(time_test, precip_test[x1, x2, :])
+X_train = preprocess(temp_train, temp_train)
+pca_model = fit(PCA, X_train; maxoutdim=1)
+
+# project the test data onto the PCA basis
+train_embedded = predict(pca_model, X_train)
+
+# now we have PC vlues for training/testing data. For the gridcell in precip, let's do a linear model using our PCA as a predictor.
+
+# need to make a dataframe for lm syntax
+df = DataFrame(x=vec(train_embedded'), y=Float64.(precip_gridcell))
+reg_model = lm(@formula(y ~ x), df)
+
+# now, create the test input
+X_test = preprocess(temp_test, temp_train)
+test_embedded = predict(pca_model, X_test)
+
+precip_pred = predict(reg_model, DataFrame(x=vec(test_embedded)))
+plot(time_test, precip_pred, label="Predicted")
+plot!(time_test, precip_test[x1, x2, :], label="Actual")
 ```
 
-Here are some metrics that see how good my fit was, and also justify the number of PCA components.
+Here are some metrics that see how good my fit was for these examples, and also justify the number of PCA components.
+
 ```{julia}
 # create a scree plot to justify the number of PC's used
 pca_model = fit(PCA, preprocess(temp_train, temp_train); maxoutdim=25, pratio=0.999);
@@ -266,18 +291,62 @@ plot(
 ```
 Notice the elbow of the scree plot is pretty much at PC=2. The first principle component explains over 90% of the variance of the data, so using only 2 PCs for KNN is a pretty valid choice as is using only 1 PC for the regression for ease of coding.
 
+Here are the residuals for my linear fit. I'll comment on these in the model comparison section, but it's pretty apparent that they're correlated with my x values.
+```{julia}
+res_values = residuals(reg_model)
+plot(
+    time_train,
+    res_values,
+    seriestype=:scatter,
+    xlabel="Time",
+    ylabel="Residual Value",
+    label="Residuals"
+    )
+```
+
+Next I'll calculate the difference in MSE between the KNN method and the linear model (postive means that the KNN model has a higher MSE).
+
 ```{julia}
 # calculate MSE for PCA by taking the mean of the 3 timesteps
 mse_avg_knn = mean(mse_pcaknn)
 
 # calculate MSE for linear model
 mse_lm = mean((precip_test[x1, x2, :] .- precip_pred).^2)
+
+mse_diff = mse_avg_knn - mse_lm
+print(mse_diff)
 ```
 
+Sometimes, the MSE is higher for the PCA-KNN approach, or the MSE might be higher for the linear regression approach. This varies based on the gridcell in precipitation that I'm running the linear model on or the time slice of precipitation I'm running PCA-KNN on. It's hard to quantify the true MSE of each of these unless I did comprehensive sampling of the data at each gridcell or timestep. This could be a source of improvement on this report, but I struggled mightily to implement the simple cases herein and doing a more comprehensive quantification of MSE would be beyond my current scope.
 
-Below was my best attempt at doing a quantile-quantile model for downscaling. I didn't include it as I couldn't get it to work with downscaling, but I include it here to show some of the work I put into this project.
+# Methods
+In both methods, I used PCA on the temperature data to reduce the dimensions down from space and time just to principle component space. This was the overarching theme between both KNN and linear regression, as I found this was the most powerful way to do "downscaling" by removing the dimensions of the coarse temperature data, thus allowing me to conduct some kind of modeling with the finer precipitation data. For PCA, I used a train/test split similar to the last lab, where the last 10 years were my testing data. I used data from 1979-2022, as I wanted to have at least 30 years of training data.
 
-```julia
+## PCA-KNN
+This method used a non-parametric approach with several steps.  In this case, I used KNN in the principal components space to choose the most important time steps from the temperature data. I then used that to select the corresponding time steps in the precipitation data, thus mapping coarse temperature data to finer precipitation data. This process was done for 3 random days to choose as the X_i in KNN. As evidenced by the output graphs, the actual precipitation values were often very different from the others. In terms of hyperparameter choices, I made a few decisions. The scree plot showed a significant elbow in the first couple principal components, so I deemed it reasonable to just use 3. I used a modest K-value of 3 to decrease the model bias, but this also caused high variance between runs on different days. 
+
+## Linear Regression
+This method used the Julia package, GLM.jl, to create a generalized linear model between the temperature data principal components and a specific gridcell of the precipitation data. The temperature data principal components allow for the difference in dimensions between the datasets to be irrelevant; however, the major limitation of only examining one gridcell limits how useful this method is. Additionally, this linear model does not use the Bayesian approaches that we learned in class based on log likelihood or a priori estimates, and as far as I can tell, also has little to do with the distributions of our data. I attempted to implement a more statistics-based approach, but I couldn't solve the multitude of errors it brought, so I was forced to choose a simpler linear model. Given precipitation's extreme non-linearity and also its tendencies to have values of 0, this generally had a very high MSE/obviously did not fit the data well at all.
+
+# Model Comparison
+
+As we can see from the MSE changing wildly for each model, it's hard to say which model is better. I'd instead consider the use cases for each model. The KNN approach is exceptionally useful for analyzing the difference at a given time on a regional scale between reconstructed precipitation and the actual precipitation measurements. Given that we're only conditioning on temperature, which is only a piece of the story of precipitation, I'd expect it not to reconstruct it very well. However, this could be useful to constrain at least some effect of temperature on regional precipitation, even when we have only a coarse regional temperature data product.
+
+The use case for linear regression is also something I see as a big advantage. Precipitation is controlled by many factors, and if more are included as predictors, it's possible that the regression could become more robust. Being able to predict precipitation trend at a more local location is a valuable tool for those who might live there or a company interested in a specific location. It would be interesting to analyze gauge data within the smaller gridcells and see how it compares to both the observed gridcell value and the predicted gridcell value. A major limitation, however, is the inability to properly simulate extreme values. A better linear regression such as a polynomial fit could solve this problem, but my linear regression model was only able to do mostly a simpler linear fit. We can see in the plot of the residuals that they are highly correlated with our predictor. This means our fit is really bad and we need to get a better one in order to make any kind of predictions.
+
+Overall, both models are interesting for analyzing specific trends and have their own use cases, but are both pretty bad and need major improvements, which is what I'd expect given I'm trying to do a lot (predict fine precipitation values) with very little (coarse temperature data).
+
+# Conclusion
+This is a pretty complicated problem. It feels like the use case for each model should be considered carefully before choosing one that is appropriate for using on gridded data, such as whether you're predicting one gridcell or a regional scale. Simple linear regression methods look like they're not even close to good enough, while PCA-KNN approaches capture some information at a regional scale but are also often inaccurate. Overall, it seems like much, much work should be added for either of my models to make them better and more accurately represent the precipitation data.
+
+
+
+```{julia}
+#|eval: false
+#|echo: false
+
+# Below was my best attempt at doing a quantile-quantile model for downscaling. I didn't include it as I couldn't get it to work with downscaling, but I include it here to show some of the work I put into this project.
+
 # define a function to flatten 3-D data
 # as a note: this was annoying to figure out in the last lab, and I think it'd be a good candidate for code to just give us in the lab
 function flatten_3d(data3d)
