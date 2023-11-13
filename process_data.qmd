@@ -1,5 +1,6 @@
 ---
-title: "Process Data"
+title: "Project Report"
+author: "Grant Parajuli, gap6"
 jupyter: julia-1.9
 execute:
     echo: false
@@ -54,6 +55,8 @@ for year in 1979:2022
 end
 
 temp_joined = datasets["temp_1979_ds"]["t2m"][lon_left:lon_right,lat_upper:lat_lower,:];
+temp_lat = reverse(datasets["temp_1979_ds"]["latitude"][lat_upper:lat_lower])
+temp_lon = datasets["temp_1979_ds"]["longitude"][lon_left:lon_right]
 time_joined = datasets["temp_1979_ds"]["time"][:];
 
 for (key, dataset) in datasets
@@ -183,8 +186,38 @@ function predict_lm(temp_train, precip_train;)
     reg_model = lm(@formula(y ~ x), df)
 end
 ```
+# Executive Summary
+In this project, I focused on downscaling coarse temperature data over Texas from the ERA-5 Reanalysis to finer precipitation data over Texas from NOAA's CPC Gauge-Based analysis data. I used 2 methods: PCA with KNN, and PCA with linear regression. Notably, these two methods accomplished slightly different aims, as PCA with KNN could be used for the Texas-scale reconstructions at any timesteps within the dataset. The linear regression could instead be used for current or future predictions, but could only predict an individual gridcell value of precipitation.
+Broadly, the downscaling I'm doing mostly comes from using coarse temperature data to predict finer precipitation data. I mostly used the entire Texas region for this analysis, except for the linear regression that required only a single gridcell value. I used the years 1979-2022 to make sure I had a good sample for both the training and testing data.
+The results of applying these methods were mostly inconclusive, as both models were pretty bad for actually predicting precipitation based only on temperature. Multiple improvements could be made for these analyses, including a more statiscally based linear model with a better fit to the data, or adding more variables to condition on to both analyses such as pressure levels/wind speeds. This report would also benefit from a more robust analysis of MSE between the two datasets, but this would require some major code refactoring to be able to run both methods for a large amount of samples and examine the distribution of results.
+In conclusion, this is a difficult problem for which a very sophisticated model should be considered for a very specific problem. Here, I sought to showcase two different methods of downscaling that may have somewhat different applications. However, if I had a more applied focus, I would pick only one of the models and seek to make it as good as possible for that given application. 
 
 # Exploratory Data Analysis
+
+First, here's a look of a heatmap of both my datasets at a given timestep. One can see that the temperature data is at a coarser resolution than the precipitation data from these plots.
+```{julia}
+    p1 = heatmap(
+        temp_lon,
+        temp_lat,
+        temp_joined_averaged[:,:,1]';
+        xlabel="Longitude",
+        ylabel="Latitude",
+        title="Temperature (1979-01-01)",
+        aspect_ratio=:equal,
+        clims=(0, 300)
+    )
+    p2 = heatmap(
+        precip_lon,
+        precip_lat,
+        precip_tx_joined[:,:,1]';
+        xlabel="Longitude",
+        ylabel="Latitude",
+        title="Precipitation (1979-01-01)",
+        aspect_ratio=:equal,
+        clims=(0, 70)
+    )
+    plot(p1, p2; layout=(2, 1), size=(1000, 400))
+```
 
 Now, I'll do a PCA-KNN analysis like we did in Lab 6. I'll detail the methods more in the relevant section. Below is the results from 3 randomly selected days of this PCA-KNN analysis.
 
@@ -320,7 +353,7 @@ print(mse_diff)
 Sometimes, the MSE is higher for the PCA-KNN approach, or the MSE might be higher for the linear regression approach. This varies based on the gridcell in precipitation that I'm running the linear model on or the time slice of precipitation I'm running PCA-KNN on. It's hard to quantify the true MSE of each of these unless I did comprehensive sampling of the data at each gridcell or timestep. This could be a source of improvement on this report, but I struggled mightily to implement the simple cases herein and doing a more comprehensive quantification of MSE would be beyond my current scope.
 
 # Methods
-In both methods, I used PCA on the temperature data to reduce the dimensions down from space and time just to principle component space. This was the overarching theme between both KNN and linear regression, as I found this was the most powerful way to do "downscaling" by removing the dimensions of the coarse temperature data, thus allowing me to conduct some kind of modeling with the finer precipitation data. For PCA, I used a train/test split similar to the last lab, where the last 10 years were my testing data. I used data from 1979-2022, as I wanted to have at least 30 years of training data.
+In both methods, I used PCA on the temperature data to reduce the dimensions down from space and time just to principle component space. This was the overarching theme between both KNN and linear regression, as I found this was the most powerful way to do "downscaling" by removing the dimensions of the coarse temperature data, thus allowing me to conduct some kind of modeling with the finer precipitation data. For PCA, I used a train/test split similar to the last lab, where the last 10 years were my testing data. I used data from 1979-2022, as I wanted to have at least 30 years of training data. Temperature data was resampled from hourly data to daily data to match the daily precipitation data.
 
 ## PCA-KNN
 This method used a non-parametric approach with several steps.  In this case, I used KNN in the principal components space to choose the most important time steps from the temperature data. I then used that to select the corresponding time steps in the precipitation data, thus mapping coarse temperature data to finer precipitation data. This process was done for 3 random days to choose as the X_i in KNN. As evidenced by the output graphs, the actual precipitation values were often very different from the others. In terms of hyperparameter choices, I made a few decisions. The scree plot showed a significant elbow in the first couple principal components, so I deemed it reasonable to just use 3. I used a modest K-value of 3 to decrease the model bias, but this also caused high variance between runs on different days. 
@@ -339,6 +372,7 @@ Overall, both models are interesting for analyzing specific trends and have thei
 # Conclusion
 This is a pretty complicated problem. It feels like the use case for each model should be considered carefully before choosing one that is appropriate for using on gridded data, such as whether you're predicting one gridcell or a regional scale. Simple linear regression methods look like they're not even close to good enough, while PCA-KNN approaches capture some information at a regional scale but are also often inaccurate. Overall, it seems like much, much work should be added for either of my models to make them better and more accurately represent the precipitation data.
 
+Citations: I discussed general approaches with Lily, Maddie, Catharine, and Kyle. I used Chat-GPT and GitHub Co-Pilot to generate ideas on how to implement functions and solve errors, but all code here is my own or has been significantly modified to align with my specific methods.
 
 
 ```{julia}
